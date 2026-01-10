@@ -1,0 +1,857 @@
+#include <WiFi.h>
+#include <ESP32Servo.h>
+#include <WebServer.h>
+#include <time.h>
+#include <sys/time.h>
+#include <esp_camera.h>
+
+const char* ssid = "ESP32_CAM";
+const char* password = "Bonjour!";
+const long gmtOffset_sec = 3600;      // UTC+1 (France hiver)
+const int daylightOffset_sec = 0;     // 0 en hiver, 3600 en été
+
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+Servo myServo;
+const int servoPin = 14;
+int currentAngle = 90;
+
+WebServer server(80);
+
+struct ScheduleEntry {
+  int day;
+  String name;
+  String time;
+  String date;
+  time_t epoch;
+  bool executed;
+};
+
+std::vector<ScheduleEntry> scheduleList;
+// forward declarations for handlers used before their definitions
+void sendCorsHeaders();
+
+// ----- PAGE HTML COMPLÈTE -----
+const char* htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scheduler Servo</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f4f4f9; }
+header { background: #4a90e2; color: white; padding: 1rem; text-align: center; display: flex; justify-content: space-between; align-items: center; }
+header h1 { margin: 0; }
+.language-selector { display: flex; gap: 0.5rem; align-items: center; }
+.language-selector select { padding: 0.5rem; border-radius: 5px; border: none; background: white; color: #4a90e2; cursor: pointer; font-weight: bold; }
+main { padding: 1rem; }
+.card { background: white; padding: 1rem; margin-bottom: 1rem; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.1); }
+button { background: #4a90e2; color: white; border: none; padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer; }
+button:hover { background: #357ab8; }
+.day-block { border: 1px solid #e0e0e0; padding: 0.5rem; margin-top: 0.5rem; border-radius: 6px; background:#fafafa; }
+.day-block .entries { display: flex; flex-direction: column; gap: 0.4rem; margin-top:0.5rem; }
+.entry-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap; /* autorise le retour à la ligne */
+  width: 100%;
+  box-sizing: border-box;
+}
+.entry-row input[type="text"], .entry-row input[type="time"], .entry-row input[type="date"] { padding: 0.25rem; border-radius: 4px; border: 1px solid #ccc; }
+.small-btn {
+  flex: 0 0 auto;
+}
+.small-btn { background:#ddd; color:#222; padding:0.25rem 0.5rem; border-radius:4px; border:none; cursor:pointer; }
+.small-btn:hover { background:#ccc; }
+.row-label {
+  flex: 0 0 70px;
+  min-width: 70px;
+}
+.entry-row .entry-name,
+.entry-row .entry-time,
+.entry-row .entry-date {
+  flex: 1 1 140px; /* grow | shrink | base */
+  min-width: 120px; /* garanti visibilité */
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.card { overflow-x: auto; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1 data-i18n="title">Scheduler Servo</h1>
+  <div class="language-selector">
+    <label for="langSelect" data-i18n="language">Langue:</label>
+    <select id="langSelect">
+      <option value="fr">Français</option>
+      <option value="en">English</option>
+      <option value="de">Deutsch</option>
+      <option value="ja">日本語</option>
+    </select>
+    <label style="font-size: 0.9rem;">
+      <input type="checkbox" id="autoLocale" checked>
+      <span data-i18n="autoDetect">Auto-détection</span>
+    </label>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <h2>Caméra en direct</h2>
+    <div style="text-align:center; background:#000; padding:0.5rem; border-radius:8px;">
+      <img id="camStream" src="/jpg?ts=0" alt="Flux ESP32-CAM" style="width:100%; max-width:640px; border-radius:6px; display:block; margin:0 auto;" />
+    </div>
+    <p style="font-size:0.9rem;color:#666;margin-top:0.5rem;">Flux snapshot (polling) — si nécessaire tester /jpg</p>
+  </div>
+
+  <script>
+    (function(){
+      const img = document.getElementById('camStream');
+      function reload(){ img.src = '/jpg?ts=' + Date.now(); }
+      // ajuster l'intervalle si votre réseau/CPU n'aime pas 800ms
+      setInterval(reload, 800);
+      reload();
+    })();
+  </script>
+
+  <div class="card">
+    <h2 data-i18n="addAction">Ajouter une action</h2>
+    <label data-i18n="selectDays">Jour(s) :</label><br>
+    <input type="checkbox" name="day" value="0" id="day-0"> <label for="day-0" data-i18n="monday">Lundi</label>
+    <input type="checkbox" name="day" value="1" id="day-1"> <label for="day-1" data-i18n="tuesday">Mardi</label>
+    <input type="checkbox" name="day" value="2" id="day-2"> <label for="day-2" data-i18n="wednesday">Mercredi</label>
+    <input type="checkbox" name="day" value="3" id="day-3"> <label for="day-3" data-i18n="thursday">Jeudi</label>
+    <input type="checkbox" name="day" value="4" id="day-4"> <label for="day-4" data-i18n="friday">Vendredi</label>
+    <input type="checkbox" name="day" value="5" id="day-5"> <label for="day-5" data-i18n="saturday">Samedi</label>
+    <input type="checkbox" name="day" value="6" id="day-6"> <label for="day-6" data-i18n="sunday">Dimanche</label>
+    <br><br>
+
+    <div id="dayDetails"></div>
+
+    <br>
+    <button onclick="scheduleAction()" data-i18n="schedule">Programmer</button>
+  </div>
+
+  <div class="card">
+    <h2 data-i18n="scheduled">Actions programmées</h2>
+    <ul id="scheduledList"></ul>
+  </div>
+</main>
+
+<script>
+const translations = {
+  fr: {
+    title: "Scheduler Servo",
+    language: "Langue:",
+    autoDetect: "Auto-détection",
+    addAction: "Ajouter une action",
+    selectDays: "Jour(s) :",
+    monday: "Lundi",
+    tuesday: "Mardi",
+    wednesday: "Mercredi",
+    thursday: "Jeudi",
+    friday: "Vendredi",
+    saturday: "Samedi",
+    sunday: "Dimanche",
+    schedule: "Programmer",
+    scheduled: "Actions programmées",
+    addTime: "Ajouter horaire",
+    removeDay: "Retirer jour",
+    actionName: "Nom de l'action",
+    selectAtLeastOne: "Sélectionnez au moins un jour !",
+    fillFields: "Veuillez renseigner le nom et l'heure pour chaque ligne de",
+    noEntries: "Aucune entrée à envoyer.",
+    sendError: "Erreur lors de l'envoi.",
+    unexpectedError: "Erreur inattendue."
+  },
+  en: {
+    title: "Scheduler Servo",
+    language: "Language:",
+    autoDetect: "Auto-detection",
+    addAction: "Add an action",
+    selectDays: "Day(s):",
+    monday: "Monday",
+    tuesday: "Tuesday",
+    wednesday: "Wednesday",
+    thursday: "Thursday",
+    friday: "Friday",
+    saturday: "Saturday",
+    sunday: "Sunday",
+    schedule: "Schedule",
+    scheduled: "Scheduled actions",
+    addTime: "Add time slot",
+    removeDay: "Remove day",
+    actionName: "Action name",
+    selectAtLeastOne: "Select at least one day!",
+    fillFields: "Please fill in the name and time for each row of",
+    noEntries: "No entries to send.",
+    sendError: "Error sending data.",
+    unexpectedError: "Unexpected error."
+  },
+  de: {
+    title: "Scheduler Servo",
+    language: "Sprache:",
+    autoDetect: "Automatische Erkennung",
+    addAction: "Eine Aktion hinzufügen",
+    selectDays: "Tag(e):",
+    monday: "Montag",
+    tuesday: "Dienstag",
+    wednesday: "Mittwoch",
+    thursday: "Donnerstag",
+    friday: "Freitag",
+    saturday: "Samstag",
+    sunday: "Sonntag",
+    schedule: "Planen",
+    scheduled: "Geplante Aktionen",
+    addTime: "Zeitslot hinzufügen",
+    removeDay: "Tag entfernen",
+    actionName: "Aktionsname",
+    selectAtLeastOne: "Wählen Sie mindestens einen Tag!",
+    fillFields: "Bitte füllen Sie Name und Zeit für jede Zeile von aus",
+    noEntries: "Keine Einträge zum Senden.",
+    sendError: "Fehler beim Senden.",
+    unexpectedError: "Unerwarteter Fehler."
+  },
+  ja: {
+    title: "スケジューラーサーボ",
+    language: "言語:",
+    autoDetect: "自動検出",
+    addAction: "アクションを追加",
+    selectDays: "曜日:",
+    monday: "月曜日",
+    tuesday: "火曜日",
+    wednesday: "水曜日",
+    thursday: "木曜日",
+    friday: "金曜日",
+    saturday: "土曜日",
+    sunday: "日曜日",
+    schedule: "スケジュール設定",
+    scheduled: "スケジュール済みアクション",
+    addTime: "時間を追加",
+    removeDay: "曜日を削除",
+    actionName: "アクション名",
+    selectAtLeastOne: "少なくとも1つの曜日を選択してください!",
+    fillFields: "次の各行の名前と時間を入力してください:",
+    noEntries: "送信するエントリがありません。",
+    sendError: "送信エラーが発生しました。",
+    unexpectedError: "予期しないエラーが発生しました。"
+  }
+};
+
+const dayNames = {
+  fr: ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"],
+  en: ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"],
+  de: ["Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag","Sonntag"],
+  ja: ["月曜日","火曜日","水曜日","木曜日","金曜日","土曜日","日曜日"]
+};
+
+let currentLanguage = 'fr';
+
+function detectBrowserLanguage() {
+  const browserLang = navigator.language.split('-')[0];
+  const supportedLangs = ['fr', 'en', 'de', 'ja'];
+  return supportedLangs.includes(browserLang) ? browserLang : 'fr';
+}
+
+function t(key) {
+  return translations[currentLanguage]?.[key] || translations['fr'][key] || key;
+}
+
+function updateTranslations() {
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    el.textContent = t(key);
+  });
+  
+  document.querySelectorAll('.entry-name').forEach(el => {
+    el.placeholder = t('actionName');
+  });
+  
+  loadScheduledActions();
+}
+
+function initLanguage() {
+  const savedLang = localStorage.getItem('selectedLanguage');
+  const autoLocaleCheckbox = document.getElementById('autoLocale');
+  
+  if (savedLang) {
+    currentLanguage = savedLang;
+    autoLocaleCheckbox.checked = false;
+  } else if (autoLocaleCheckbox.checked) {
+    currentLanguage = detectBrowserLanguage();
+  }
+  
+  document.getElementById('langSelect').value = currentLanguage;
+  document.documentElement.lang = currentLanguage;
+  updateTranslations();
+}
+
+document.getElementById('langSelect').addEventListener('change', (e) => {
+  currentLanguage = e.target.value;
+  document.documentElement.lang = currentLanguage;
+  localStorage.setItem('selectedLanguage', currentLanguage);
+  document.getElementById('autoLocale').checked = false;
+  updateTranslations();
+});
+
+document.getElementById('autoLocale').addEventListener('change', (e) => {
+  if (e.target.checked) {
+    currentLanguage = detectBrowserLanguage();
+    document.getElementById('langSelect').value = currentLanguage;
+    localStorage.removeItem('selectedLanguage');
+  } else {
+    localStorage.setItem('selectedLanguage', currentLanguage);
+  }
+  document.documentElement.lang = currentLanguage;
+  updateTranslations();
+});
+
+function ensureDayDetail(dayValue) {
+  const container = document.getElementById('dayDetails');
+  const id = `detail-${dayValue}`;
+  if (document.getElementById(id)) return;
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'day-block';
+  wrapper.id = id;
+
+  const header = document.createElement('div');
+  header.style.display = 'flex';
+  header.style.justifyContent = 'space-between';
+  header.style.alignItems = 'center';
+
+  const title = document.createElement('span');
+  title.textContent = dayNames[currentLanguage][dayValue] + ':';
+  title.style.fontWeight = '700';
+
+  const controls = document.createElement('div');
+
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'small-btn';
+  addBtn.textContent = t('addTime');
+  addBtn.onclick = () => addEntryRow(dayValue);
+
+  const removeDayBtn = document.createElement('button');
+  removeDayBtn.type = 'button';
+  removeDayBtn.className = 'small-btn';
+  removeDayBtn.textContent = t('removeDay');
+  removeDayBtn.onclick = () => {
+    document.querySelector(`input[name="day"][value="${dayValue}"]`).checked = false;
+    removeDayDetail(dayValue);
+  };
+
+  controls.appendChild(addBtn);
+  controls.appendChild(removeDayBtn);
+  header.appendChild(title);
+  header.appendChild(controls);
+
+  const entries = document.createElement('div');
+  entries.className = 'entries';
+  entries.id = `entries-${dayValue}`;
+
+  wrapper.appendChild(header);
+  wrapper.appendChild(entries);
+
+  container.appendChild(wrapper);
+
+  addEntryRow(dayValue);
+}
+
+function addEntryRow(dayValue, nameVal = '', timeVal = '', dateVal = '') {
+  const entries = document.getElementById(`entries-${dayValue}`);
+  if (!entries) return;
+
+  const row = document.createElement('div');
+  row.className = 'entry-row';
+
+  const label = document.createElement('span');
+  label.className = 'row-label';
+  label.textContent = '';
+
+  const nameInput = document.createElement('input');
+  nameInput.type = 'text';
+  nameInput.placeholder = t('actionName');
+  nameInput.className = 'entry-name';
+  nameInput.value = nameVal;
+
+  const timeInput = document.createElement('input');
+  timeInput.type = 'time';
+  timeInput.className = 'entry-time';
+  timeInput.value = timeVal;
+
+  const dateInput = document.createElement('input');
+  dateInput.type = 'date';
+  dateInput.className = 'entry-date';
+  dateInput.value = dateVal;
+
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'small-btn';
+  removeBtn.textContent = '×';
+  removeBtn.title = t('removeDay');
+  removeBtn.onclick = () => row.remove();
+
+  row.appendChild(label);
+  row.appendChild(nameInput);
+  row.appendChild(timeInput);
+  row.appendChild(dateInput);
+  row.appendChild(removeBtn);
+
+  entries.appendChild(row);
+}
+
+function removeDayDetail(dayValue) {
+  const id = `detail-${dayValue}`;
+  const el = document.getElementById(id);
+  if (el) el.remove();
+}
+
+function onDayCheckboxChange(e) {
+  const val = e.target.value;
+  if (e.target.checked) {
+    ensureDayDetail(val);
+  } else {
+    removeDayDetail(val);
+  }
+}
+
+document.querySelectorAll('input[name="day"]').forEach(cb => {
+  cb.addEventListener('change', onDayCheckboxChange);
+});
+
+function scheduleAction() {
+  const checked = [...document.querySelectorAll('input[name="day"]:checked')];
+  if (checked.length === 0) {
+    alert(t('selectAtLeastOne'));
+    return;
+  }
+
+  try {
+    const entries = [];
+    checked.forEach(cb => {
+      const day = cb.value;
+      const entriesContainer = document.getElementById(`entries-${day}`);
+      if (!entriesContainer) throwAlertMissing(day);
+
+      const rows = [...entriesContainer.querySelectorAll('.entry-row')];
+      if (rows.length === 0) throwAlertMissing(day);
+
+      rows.forEach(r => {
+        const name = (r.querySelector('.entry-name')?.value || '').trim();
+        const time = (r.querySelector('.entry-time')?.value || '').trim();
+        const date = (r.querySelector('.entry-date')?.value || '').trim();
+        if (!name || !time) {
+          throwAlertMissing(day);
+          throw 'missing_fields';
+        }
+        entries.push({ day: Number(day), name, time, date });
+      });
+    });
+
+    if (entries.length === 0) {
+      alert(t('noEntries'));
+      return;
+    }
+
+    const clientNow = Math.floor(Date.now() / 1000);
+    console.log('Envoi clientTime:', clientNow);
+    console.log('Heure locale du client:', new Date().toLocaleString('fr-FR'));
+
+    const payload = { 
+      entries,
+      clientTime: clientNow
+    };
+    
+    fetch('http://192.168.4.1/schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(res => res.text())
+      .then(txt => {
+        alert(txt);
+        loadScheduledActions();
+      }).catch(err => {
+        console.error(err);
+        alert(t('sendError'));
+      });
+
+  } catch (err) {
+    if (err === 'missing_fields') return;
+    console.error(err);
+    alert(t('unexpectedError'));
+  }
+}
+
+function throwAlertMissing(day) {
+  alert(`${t('fillFields')} ${dayNames[currentLanguage][day]}!`);
+}
+
+function loadScheduledActions() {
+  fetch('/get_schedule')
+    .then(res => res.json())
+    .then(data => {
+      const list = document.getElementById('scheduledList');
+      list.innerHTML = '';
+      const entries = data.entries || [];
+      
+      if (entries.length === 0) {
+        list.innerHTML = '<li>' + t('noEntries') + '</li>';
+        return;
+      }
+      
+      entries.forEach(a => {
+        const li = document.createElement('li');
+        if (a.date) {
+          li.textContent = `${a.name} le ${a.date} à ${a.time}`;
+        } else {
+          li.textContent = `${dayNames[currentLanguage][a.day]} — ${a.name} à ${a.time}`;
+        }
+        list.appendChild(li);
+      });
+    }).catch(err => {
+      console.error(err);
+    });
+}
+
+initLanguage();
+loadScheduledActions();
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+time_t dateTimeToEpoch(const String &dateStr, const String &timeStr) {
+  if (dateStr.length() < 10 || timeStr.length() < 5) return 0;
+  
+  struct tm tmSched = {};
+  tmSched.tm_year = dateStr.substring(0,4).toInt() - 1900;
+  tmSched.tm_mon  = dateStr.substring(5,7).toInt() - 1;
+  tmSched.tm_mday = dateStr.substring(8,10).toInt();
+  tmSched.tm_hour = timeStr.substring(0,2).toInt();
+  tmSched.tm_min  = timeStr.substring(3,5).toInt();
+  tmSched.tm_sec  = 0;
+  tmSched.tm_isdst = -1;
+  
+  time_t result = mktime(&tmSched);
+  
+  Serial.printf("Parsed: %04d-%02d-%02d %02d:%02d:%02d → epoch %lld\n",
+    tmSched.tm_year + 1900, tmSched.tm_mon + 1, tmSched.tm_mday,
+    tmSched.tm_hour, tmSched.tm_min, tmSched.tm_sec, (long long)result);
+  
+  return result;
+}
+
+void doThreeRotations() {
+  for (int turn = 0; turn < 3; ++turn) {
+    myServo.write(180);
+    delay(500);
+    myServo.write(0);
+    delay(500);
+  }
+  myServo.write(currentAngle);
+}
+
+void handleStream() {
+  sendCorsHeaders();
+  WiFiClient client = server.client();
+  String hdr = String("HTTP/1.1 200 OK\r\n")
+             + "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  client.write(hdr.c_str(), hdr.length());
+
+  while (client.connected()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      break;
+    }
+
+    client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", (unsigned)fb->len);
+    client.write(fb->buf, fb->len);
+    client.write("\r\n");
+    esp_camera_fb_return(fb);
+
+    if (!client.connected()) break;
+    delay(100); // ajuster pour réduire/augmenter fps
+  }
+}
+
+void handleJPG() {
+  sendCorsHeaders();
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("❌ Capture failed (handleJPG)");
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+
+  WiFiClient client = server.client();
+  String hdr = String("HTTP/1.1 200 OK\r\n") +
+               "Content-Type: image/jpeg\r\n" +
+               "Content-Length: " + String(fb->len) + "\r\n\r\n";
+  client.write(hdr.c_str(), hdr.length());
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void sendCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+void handleSchedule() {
+  sendCorsHeaders();
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method not allowed");
+    return;
+  }
+
+  String body = server.arg("plain");
+  Serial.println("Reçu: " + body);
+
+  int timeIdx = body.indexOf("\"clientTime\":");
+  if (timeIdx >= 0) {
+    int vstart = body.indexOf(":", timeIdx) + 1;
+    int vend = body.indexOf(",", vstart);
+    if (vend == -1) vend = body.indexOf("}", vstart);
+    time_t clientTime = body.substring(vstart, vend).toInt();
+    
+    // Appliquer le fuseau horaire
+    clientTime += gmtOffset_sec + daylightOffset_sec;
+    
+    timeval tv;
+    tv.tv_sec = clientTime;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    
+    Serial.printf("⏰ Sync client (avec offset +%ld): %lld\n", 
+                  gmtOffset_sec + daylightOffset_sec, (long long)clientTime);
+    
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+    Serial.printf("Heure ESP32: %04d-%02d-%02d %02d:%02d:%02d\n",
+      timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+      timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+  }
+
+  scheduleList.clear();
+
+  int idx = 0;
+  while ((idx = body.indexOf("{\"day\":", idx)) != -1) {
+    int objEnd = body.indexOf("}", idx);
+    if (objEnd == -1) break;
+    String obj = body.substring(idx, objEnd + 1);
+
+    if (obj.indexOf("\"clientTime\"") >= 0) {
+      idx = objEnd + 1;
+      continue;
+    }
+
+    ScheduleEntry e = {};
+    int p;
+    if ((p = obj.indexOf("\"day\":")) >= 0) {
+      int vstart = obj.indexOf(":", p) + 1;
+      int vend = obj.indexOf(",", vstart);
+      if (vend == -1) vend = obj.indexOf("}", vstart);
+      e.day = obj.substring(vstart, vend).toInt();
+    }
+    if ((p = obj.indexOf("\"name\":\"")) >= 0) {
+      int s = p + 8;
+      int epos = obj.indexOf("\"", s);
+      if (epos > s) e.name = obj.substring(s, epos);
+    }
+    if ((p = obj.indexOf("\"time\":\"")) >= 0) {
+      int s = p + 8;
+      int epos = obj.indexOf("\"", s);
+      if (epos > s) e.time = obj.substring(s, epos);
+    }
+    if ((p = obj.indexOf("\"date\":\"")) >= 0) {
+      int s = p + 8;
+      int epos = obj.indexOf("\"", s);
+      if (epos > s) {
+        e.date = obj.substring(s, epos);
+        e.epoch = dateTimeToEpoch(e.date, e.time);
+      }
+    }
+
+    if (e.time.length() >= 5 && (e.date.length() > 0 || (e.day >= 0 && e.day <= 6))) {
+      scheduleList.push_back(e);
+      Serial.printf("✓ Ajouté: %s à %s (epoch=%lld)\n", e.name.c_str(), e.time.c_str(), (long long)e.epoch);
+    }
+
+    idx = objEnd + 1;
+  }
+
+  server.send(200, "text/plain", "Programmation reçue et synchronisée !");
+}
+
+void handleGetSchedule() {
+  sendCorsHeaders();
+  server.sendHeader("Content-Type", "application/json; charset=utf-8");
+  String json = "{\"entries\":[";
+  for (size_t i = 0; i < scheduleList.size(); ++i) {
+    if (i) json += ",";
+    json += "{\"day\":" + String(scheduleList[i].day) +
+            ",\"name\":\"" + scheduleList[i].name +
+            "\",\"time\":\"" + scheduleList[i].time +
+            "\",\"date\":\"" + scheduleList[i].date + "\"}";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+void handleOptions() {
+  sendCorsHeaders();
+  server.send(200);
+}
+
+void handleTest() {
+  sendCorsHeaders();
+  doThreeRotations();
+  server.send(200, "text/plain", "OK");
+}
+
+int getCurrentDayOfWeek() {
+  time_t now = time(nullptr);
+  struct tm* t = localtime(&now);
+  return (t->tm_wday + 6) % 7;
+}
+
+bool timeMatchesHM(const String &timeStr, struct tm *t) {
+  if (timeStr.length() < 5) return false;
+  int h = timeStr.substring(0,2).toInt();
+  int m = timeStr.substring(3,5).toInt();
+  return (t->tm_hour == h && t->tm_min == m);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  myServo.attach(servoPin, 500, 2400);
+  myServo.write(currentAngle);
+
+    WiFi.softAP(ssid, password);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // --- initialisation caméra ---
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_VGA; // réduire si mémoire faible (FRAMESIZE_SVGA/UXGA etc.)
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Erreur initialisation camera");
+  } else {
+    Serial.println("Camera initialisée");
+  }
+
+  Serial.println("✓ Serveur prêt - en attente de programmation");
+
+  server.on("/", HTTP_GET, [](){ 
+    sendCorsHeaders();
+    server.sendHeader("Content-Type", "text/html; charset=utf-8");
+    server.send_P(200, "text/html", htmlPage); 
+  });
+  
+  server.on("/schedule", HTTP_POST, handleSchedule);
+  server.on("/schedule", HTTP_OPTIONS, handleOptions);
+  server.on("/get_schedule", HTTP_GET, handleGetSchedule);
+  server.on("/get_schedule", HTTP_OPTIONS, handleOptions);
+  server.on("/test", HTTP_GET, handleTest);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.on("/jpg", HTTP_GET, handleJPG);
+
+  server.begin();
+  Serial.println("✓ Serveur Web démarré");
+}
+
+void loop() {
+  server.handleClient();
+
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 1000) return;
+  lastCheck = millis();
+
+  time_t now = time(nullptr);
+  struct tm tmNow;
+  localtime_r(&now, &tmNow);
+
+  for (auto &e : scheduleList) {
+    if (e.executed) continue;
+
+    if (e.date.length() > 0) {
+      if (e.epoch != 0) {
+        long long diff = (long long)now - (long long)e.epoch;
+        
+        if (diff >= 0 && diff < 60) {
+          Serial.printf("🚀 TRIGGER EXACT: %s à %s\n", e.date.c_str(), e.time.c_str());
+          doThreeRotations();
+          e.executed = true;
+        }
+      }
+    } else {
+      int today = getCurrentDayOfWeek();
+      if (e.day == today && timeMatchesHM(e.time, &tmNow)) {
+        Serial.printf("🚀 TRIGGER HEBDOMADAIRE: %s à %s\n", e.name.c_str(), e.time.c_str());
+        doThreeRotations();
+        e.executed = true;
+      }
+    }
+  }
+
+  static int last_min = -1;
+  if (tmNow.tm_min != last_min) {
+    last_min = tmNow.tm_min;
+    for (int i = (int)scheduleList.size() - 1; i >= 0; --i) {
+      if (scheduleList[i].date.length() > 0 && scheduleList[i].executed) {
+        scheduleList.erase(scheduleList.begin() + i);
+      }
+    }
+    for (auto &e : scheduleList) {
+      if (e.date.length() == 0) e.executed = false;
+    }
+  }
+}

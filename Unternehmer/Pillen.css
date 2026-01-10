@@ -1,0 +1,403 @@
+#include <WiFi.h>
+#include <ESP32Servo.h>
+#include <WebServer.h>
+#include <time.h>
+#include <sys/time.h>
+#include <esp_camera.h>
+#include <vector>
+
+const char* ssid = "ESP32_CAM";
+const char* password = "Bonjour!";
+const long gmtOffset_sec = 3600;      // UTC+1 (France)
+const int daylightOffset_sec = 0;     // 0 en hiver, 3600 en été
+const char* tzString = "CET-1CEST,M3.5.0/02:00,M10.5.0/03:00"; // timezone Europe/Paris
+
+Servo myServo;
+const int servoPin = 14;
+int currentAngle = 90;
+
+WebServer server(80);
+
+struct ScheduleEntry {
+  int day;
+  String name;
+  String time;
+  String date;
+  time_t epoch;
+  bool executed;
+};
+
+std::vector<ScheduleEntry> scheduleList;
+
+// ----------------- HTML PAGE -----------------
+const char* htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scheduler Servo</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f4f4f9; }
+header { background: #4a90e2; color: white; padding: 1rem; text-align: center; display: flex; justify-content: space-between; align-items: center; }
+header h1 { margin: 0; }
+.language-selector { display: flex; gap: 0.5rem; align-items: center; }
+.language-selector select { padding: 0.5rem; border-radius: 5px; border: none; background: white; color: #4a90e2; cursor: pointer; font-weight: bold; }
+main { padding: 1rem; }
+.card { background: white; padding: 1rem; margin-bottom: 1rem; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.1); }
+button { background: #4a90e2; color: white; border: none; padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer; }
+button:hover { background: #357ab8; }
+.day-block { border: 1px solid #e0e0e0; padding: 0.5rem; margin-top: 0.5rem; border-radius: 6px; background:#fafafa; }
+.day-block .entries { display: flex; flex-direction: column; gap: 0.4rem; margin-top:0.5rem; }
+.entry-row { display: flex; gap: 0.5rem; align-items: center; }
+.entry-row input[type="text"], .entry-row input[type="time"], .entry-row input[type="date"] { padding: 0.25rem; border-radius: 4px; border: 1px solid #ccc; }
+.small-btn { background:#ddd; color:#222; padding:0.25rem 0.5rem; border-radius:4px; border:none; cursor:pointer; }
+.small-btn:hover { background:#ccc; }
+.row-label { min-width:70px; font-weight:600; }
+img#camStream { width:100%; max-width:640px; border-radius:8px; display:block; margin:0 auto; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Scheduler Servo</h1>
+</header>
+
+<main>
+  <div class="card">
+    <h2>Caméra</h2>
+    <div style="text-align:center;">
+      <img id="camStream" src="/stream" alt="ESP32-CAM stream"/>
+    </div>
+    <p style="font-size:0.9rem;color:#666;margin-top:0.5rem;">Flux vidéo MJPEG direct</p>
+  </div>
+
+  <div class="card">
+    <h2>Ajouter une action</h2>
+    <label>Jour(s) :</label><br>
+    <input type="checkbox" name="day" value="0" id="day-0"> <label for="day-0">Lundi</label>
+    <input type="checkbox" name="day" value="1" id="day-1"> <label for="day-1">Mardi</label>
+    <input type="checkbox" name="day" value="2" id="day-2"> <label for="day-2">Mercredi</label>
+    <input type="checkbox" name="day" value="3" id="day-3"> <label for="day-3">Jeudi</label>
+    <input type="checkbox" name="day" value="4" id="day-4"> <label for="day-4">Vendredi</label>
+    <input type="checkbox" name="day" value="5" id="day-5"> <label for="day-5">Samedi</label>
+    <input type="checkbox" name="day" value="6" id="day-6"> <label for="day-6">Dimanche</label>
+    <br><br>
+    <div id="dayDetails"></div>
+    <br>
+    <button onclick="scheduleAction()">Programmer</button>
+  </div>
+
+  <div class="card">
+    <h2>Actions programmées</h2>
+    <ul id="scheduledList"></ul>
+  </div>
+</main>
+
+<script>
+const dayNames = ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"];
+
+function ensureDayDetail(dayValue) {
+  const container = document.getElementById('dayDetails');
+  const id = `detail-${dayValue}`;
+  if (document.getElementById(id)) return;
+  const wrapper = document.createElement('div'); wrapper.className='day-block'; wrapper.id=id;
+  const header = document.createElement('div'); header.style.display='flex'; header.style.justifyContent='space-between';
+  const title = document.createElement('span'); title.textContent = dayNames[dayValue]+':'; title.style.fontWeight='700';
+  const controls = document.createElement('div');
+  const addBtn = document.createElement('button'); addBtn.type='button'; addBtn.className='small-btn'; addBtn.textContent='Ajouter horaire'; addBtn.onclick = ()=>addEntryRow(dayValue);
+  const removeDayBtn = document.createElement('button'); removeDayBtn.type='button'; removeDayBtn.className='small-btn'; removeDayBtn.textContent='Retirer jour'; removeDayBtn.onclick = ()=>{ document.querySelector(`input[name="day"][value="${dayValue}"]`).checked=false; removeDayDetail(dayValue); };
+  controls.appendChild(addBtn); controls.appendChild(removeDayBtn);
+  header.appendChild(title); header.appendChild(controls);
+  const entries = document.createElement('div'); entries.className='entries'; entries.id=`entries-${dayValue}`;
+  wrapper.appendChild(header); wrapper.appendChild(entries); container.appendChild(wrapper);
+  addEntryRow(dayValue);
+}
+function addEntryRow(dayValue, nameVal='', timeVal='', dateVal='') {
+  const entries = document.getElementById(`entries-${dayValue}`); if (!entries) return;
+  const row = document.createElement('div'); row.className='entry-row';
+  const nameInput = document.createElement('input'); nameInput.type='text'; nameInput.placeholder='Nom'; nameInput.className='entry-name'; nameInput.value=nameVal;
+  const timeInput = document.createElement('input'); timeInput.type='time'; timeInput.className='entry-time'; timeInput.value=timeVal;
+  const dateInput = document.createElement('input'); dateInput.type='date'; dateInput.className='entry-date'; dateInput.value=dateVal;
+  const removeBtn = document.createElement('button'); removeBtn.type='button'; removeBtn.className='small-btn'; removeBtn.textContent='×'; removeBtn.onclick = ()=>row.remove();
+  row.appendChild(nameInput); row.appendChild(timeInput); row.appendChild(dateInput); row.appendChild(removeBtn);
+  entries.appendChild(row);
+}
+function removeDayDetail(dayValue){ const id=`detail-${dayValue}`; const el=document.getElementById(id); if(el) el.remove(); }
+document.querySelectorAll('input[name="day"]').forEach(cb=>cb.addEventListener('change', (e)=>{ if(e.target.checked) ensureDayDetail(e.target.value); else removeDayDetail(e.target.value); }));
+
+function scheduleAction() {
+  const checked = [...document.querySelectorAll('input[name="day"]:checked')];
+  if (checked.length===0){ alert('Sélectionnez au moins un jour'); return; }
+  try {
+    const entries = [];
+    checked.forEach(cb=>{
+      const day = cb.value;
+      const container = document.getElementById(`entries-${day}`);
+      const rows = [...container.querySelectorAll('.entry-row')];
+      rows.forEach(r=>{
+        const name = (r.querySelector('.entry-name')?.value||'').trim();
+        const time = (r.querySelector('.entry-time')?.value||'').trim();
+        const date = (r.querySelector('.entry-date')?.value||'').trim();
+        if(!name||!time){ alert('Remplissez nom et heure'); throw 'missing'; }
+        entries.push({ day: Number(day), name, time, date });
+      });
+    });
+    const clientNow = Math.floor(Date.now()/1000);
+    const payload = { entries, clientTime: clientNow };
+    fetch('http://192.168.4.1/schedule', { method:'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) })
+      .then(r=>r.text()).then(txt=>{ alert(txt); loadScheduledActions(); }).catch(e=>{ console.error(e); alert('Erreur envoi'); });
+  } catch(e) { if(e==='missing') return; console.error(e); alert('Erreur'); }
+}
+
+function loadScheduledActions() {
+  fetch('/get_schedule').then(r=>r.json()).then(data=>{
+    const list = document.getElementById('scheduledList'); list.innerHTML='';
+    const entries = data.entries || [];
+    if(entries.length===0){ list.innerHTML='<li>Aucune entrée</li>'; return; }
+    entries.forEach(a=>{
+      const li=document.createElement('li');
+      if(a.date) li.textContent = `${a.name} le ${a.date} à ${a.time}`; else li.textContent = `${dayNames[a.day]} — ${a.name} à ${a.time}`;
+      list.appendChild(li);
+    });
+  }).catch(e=>console.error(e));
+}
+
+loadScheduledActions();
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// ----------------- Camera pins (AI-Thinker) -----------------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ----------------- utilities -----------------
+time_t dateTimeToEpoch(const String &dateStr, const String &timeStr) {
+  if (dateStr.length() < 10 || timeStr.length() < 5) return 0;
+  struct tm tmSched = {};
+  tmSched.tm_year = dateStr.substring(0,4).toInt() - 1900;
+  tmSched.tm_mon  = dateStr.substring(5,7).toInt() - 1;
+  tmSched.tm_mday = dateStr.substring(8,10).toInt();
+  tmSched.tm_hour = timeStr.substring(0,2).toInt();
+  tmSched.tm_min  = timeStr.substring(3,5).toInt();
+  tmSched.tm_sec  = 0;
+  tmSched.tm_isdst = -1;
+  time_t result = mktime(&tmSched); // mktime interprets tm as local time (TZ set)
+  Serial.printf("Parsed: %04d-%02d-%02d %02d:%02d:%02d -> epoch %lld\n",
+    tmSched.tm_year+1900, tmSched.tm_mon+1, tmSched.tm_mday,
+    tmSched.tm_hour, tmSched.tm_min, tmSched.tm_sec, (long long)result);
+  return result;
+}
+
+void doThreeRotations() {
+  for (int i=0;i<3;++i) { myServo.write(180); delay(500); myServo.write(0); delay(500); }
+  myServo.write(currentAngle);
+}
+
+void sendCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+// ----------------- Stream handler -----------------
+void handleStream() {
+  sendCorsHeaders();
+  WiFiClient client = server.client();
+  String hdr = String("HTTP/1.1 200 OK\r\n") +
+               "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  client.write(hdr.c_str(), hdr.length());
+
+  while (client.connected()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      break;
+    }
+    client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", (unsigned)fb->len);
+    client.write(fb->buf, fb->len);
+    client.write("\r\n");
+    esp_camera_fb_return(fb);
+    if (!client.connected()) break;
+    delay(100); // ~10 fps
+  }
+}
+
+// ----------------- HTTP handlers -----------------
+void handleSchedule() {
+  sendCorsHeaders();
+  if (server.method() != HTTP_POST) { server.send(405, "text/plain", "Method not allowed"); return; }
+  String body = server.arg("plain");
+  Serial.println("Reçu schedule: " + body);
+
+  // extract clientTime if present and sync RTC + TZ
+  int tIdx = body.indexOf("\"clientTime\":");
+  if (tIdx >= 0) {
+    int vstart = body.indexOf(":", tIdx) + 1;
+    int vend = body.indexOf(",", vstart);
+    if (vend == -1) vend = body.indexOf("}", vstart);
+    time_t clientTime = (time_t)body.substring(vstart, vend).toInt();
+    timeval tv; tv.tv_sec = clientTime; tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    setenv("TZ", tzString, 1);
+    tzset();
+    time_t now = time(nullptr);
+    struct tm *ti = localtime(&now);
+    Serial.printf("Sync client -> ESP time: %04d-%02d-%02d %02d:%02d:%02d (epoch %lld)\n",
+      ti->tm_year+1900, ti->tm_mon+1, ti->tm_mday, ti->tm_hour, ti->tm_min, ti->tm_sec, (long long)now);
+  }
+
+  scheduleList.clear();
+  int idx = 0;
+  while ((idx = body.indexOf("{", idx)) != -1) {
+    int objEnd = body.indexOf("}", idx);
+    if (objEnd == -1) break;
+    String obj = body.substring(idx, objEnd+1);
+    if (obj.indexOf("clientTime") >= 0) { idx = objEnd+1; continue; }
+    ScheduleEntry e; e.day=-1; e.name=""; e.time=""; e.date=""; e.epoch=0; e.executed=false;
+    int p;
+    if ((p = obj.indexOf("\"day\":")) >= 0) {
+      int vstart = obj.indexOf(":", p)+1; int vend = obj.indexOf(",", vstart); if (vend==-1) vend=obj.indexOf("}", vstart);
+      e.day = obj.substring(vstart, vend).toInt();
+    }
+    if ((p = obj.indexOf("\"name\":\"")) >= 0) { int s=p+8; int epos=obj.indexOf("\"", s); if (epos>s) e.name = obj.substring(s, epos); }
+    if ((p = obj.indexOf("\"time\":\"")) >= 0) { int s=p+8; int epos=obj.indexOf("\"", s); if (epos>s) e.time = obj.substring(s, epos); }
+    if ((p = obj.indexOf("\"date\":\"")) >= 0) { int s=p+8; int epos=obj.indexOf("\"", s); if (epos>s) { e.date = obj.substring(s, epos); e.epoch = dateTimeToEpoch(e.date, e.time); } }
+    if (e.time.length()>=5 && (e.date.length()>0 || (e.day>=0 && e.day<=6))) {
+      scheduleList.push_back(e);
+      Serial.printf("Ajouté: day=%d date=%s time=%s name=%s epoch=%lld\n", e.day, e.date.c_str(), e.time.c_str(), e.name.c_str(), (long long)e.epoch);
+    }
+    idx = objEnd+1;
+  }
+
+  server.send(200, "text/plain", "Programmation reçue et synchronisée !");
+}
+
+void handleGetSchedule() {
+  sendCorsHeaders();
+  server.sendHeader("Content-Type", "application/json; charset=utf-8");
+  String json = "{\"entries\":[";
+  for (size_t i=0;i<scheduleList.size();++i) {
+    if (i) json += ",";
+    json += "{\"day\":"+String(scheduleList[i].day)+",\"name\":\""+scheduleList[i].name+"\",\"time\":\""+scheduleList[i].time+"\",\"date\":\""+scheduleList[i].date+"\"}";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+void handleOptions() { sendCorsHeaders(); server.send(200); }
+void handleTest() { sendCorsHeaders(); doThreeRotations(); server.send(200, "text/plain", "OK"); }
+
+int getCurrentDayOfWeek() {
+  time_t now = time(nullptr); struct tm *t = localtime(&now);
+  return (t->tm_wday + 6) % 7; // 0 = lundi
+}
+bool timeMatchesHM(const String &timeStr, struct tm *t) {
+  if (timeStr.length()<5) return false;
+  int h = timeStr.substring(0,2).toInt(); int m = timeStr.substring(3,5).toInt();
+  return (t->tm_hour==h && t->tm_min==m);
+}
+
+// ----------------- setup / loop -----------------
+void setup() {
+  Serial.begin(115200); delay(1000);
+  myServo.attach(servoPin, 500, 2400);
+  myServo.write(currentAngle);
+
+  // set timezone for localtime/mktime
+  setenv("TZ", tzString, 1);
+  tzset();
+
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  // init camera
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_VGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+  if (esp_camera_init(&config) != ESP_OK) Serial.println("Erreur initialisation camera"); else Serial.println("Camera initialisée");
+
+  server.on("/", HTTP_GET, [](){ sendCorsHeaders(); server.send(200, "text/html", htmlPage); });
+  server.on("/stream", HTTP_GET, handleStream);
+  server.on("/schedule", HTTP_POST, handleSchedule);
+  server.on("/schedule", HTTP_OPTIONS, handleOptions);
+  server.on("/get_schedule", HTTP_GET, handleGetSchedule);
+  server.on("/get_schedule", HTTP_OPTIONS, handleOptions);
+  server.on("/test", HTTP_GET, handleTest);
+
+  server.begin();
+  Serial.println("Serveur démarré");
+}
+
+void loop() {
+  server.handleClient();
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 1000) return;
+  lastCheck = millis();
+
+  time_t now = time(nullptr);
+  struct tm tmNow; localtime_r(&now, &tmNow);
+  Serial.printf("⏰ Temps actuel: %04d-%02d-%02d %02d:%02d:%02d (epoch %lld)\n",
+    tmNow.tm_year+1900, tmNow.tm_mon+1, tmNow.tm_mday, tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec, (long long)now);
+
+  for (auto &e : scheduleList) {
+    if (e.executed) continue;
+    if (e.date.length() > 0) {
+      if (e.epoch != 0) {
+        long long diff = (long long)now - (long long)e.epoch;
+        Serial.printf("Entry: %s | epoch=%lld | diff=%lld\n", e.name.c_str(), (long long)e.epoch, diff);
+        if (diff >= 0 && diff < 60) { doThreeRotations(); e.executed = true; Serial.printf("TRIGGER EXACT %s\n", e.name.c_str()); }
+      }
+    } else {
+      int today = getCurrentDayOfWeek();
+      if (e.day == today && timeMatchesHM(e.time, &tmNow)) { doThreeRotations(); e.executed = true; Serial.printf("TRIGGER WEEKLY %s\n", e.name.c_str()); }
+    }
+  }
+
+  static int last_min = -1;
+  if (tmNow.tm_min != last_min) {
+    last_min = tmNow.tm_min;
+    for (int i = (int)scheduleList.size()-1; i>=0; --i) {
+      if (scheduleList[i].date.length()>0 && scheduleList[i].executed) scheduleList.erase(scheduleList.begin()+i);
+    }
+    for (auto &e : scheduleList) if (e.date.length()==0) e.executed = false;
+  }
+}
