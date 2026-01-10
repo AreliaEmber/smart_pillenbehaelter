@@ -11,3 +11,27 @@ options for handling WLAN problems with the esp/app:
 - we host the website on a server and use bluetooth connections between the phone and the esp so that we don't have to send the entire website to the phone via the esp. Should work but would be expensive
 - we try to host the esp data on a local access website with a web address and use the internet on the phone to try to connect to that address
 - we could connect the ESP to the same wifi network as the phone is connected to, although this will require the name and password of the wifi
+---
+# Git useage guide:
+to check the satus of your local branch and check that your commits have worked, use:
+```
+ git status
+```
+to stage all changes you've made (which will make them be included in the next commit) use:
+```
+git add *
+```
+to commit changes, use:
+```
+git commit -m "your commit message here"
+```
+to download others' changes from github, use:
+```
+git pull
+```
+to upload your changes to github, use:
+```
+git push
+```
+**WARNING** do not ever use `git push` without first using `git pull` <br>
+**WARNING** `git push` will only upload changes that have already been commited with `git commit`, and `git commit` will only commit changes added with `git add`
