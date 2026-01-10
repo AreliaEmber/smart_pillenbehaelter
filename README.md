@@ -10,3 +10,4 @@ options for handling WLAN problems with the esp/app:
 - we read up on how to connect to the esp with mobile networks while the phone is still connected to the internet (might not work, we're not sure yet)
 - we host the website on a server and use bluetooth connections between the phone and the esp so that we don't have to send the entire website to the phone via the esp. Should work but would be expensive
 - we try to host the esp data on a local access website with a web address and use the internet on the phone to try to connect to that address
+- we could connect the ESP to the same wifi network as the phone is connected to, although this will require the name and password of the wifi
